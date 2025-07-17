@@ -6,46 +6,95 @@ from bs4 import BeautifulSoup
 import re
 from io import BytesIO
 
-# --- Helper: Extract first valid price from a page ---
-def extract_price_from_url(url):
+
+# --- Helper: Extract quantity of coins mentioned in text ---
+def extract_quantity(text: str) -> int:
+    patterns = [
+        r"(\d{1,3})\s*(?:coins?|pcs|pieces|units)",
+        r"(?:pack|tube|box|monster box|roll)[^\d]{0,10}(\d{1,3})",
+        r"x\s?(\d{1,3})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            try:
+                qty = int(m.group(1))
+                if 1 < qty < 1000:
+                    return qty
+            except ValueError:
+                continue
+    return 1
+
+
+# --- Helper: Extract price (and quantity) from a page ---
+def extract_price_info(url: str, prefer_vat: bool = False):
+    """Return tuple of (price, quantity). Price is total price; divide by quantity for per-coin."""
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(r.content, "html.parser")
 
-        # Prefer price values contained in tags with a price related id or class
+        text = soup.get_text(" ", strip=True)
         price_regex = re.compile(r"£\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})?)")
 
-        # First search within common price containers
+        candidates = []
         for tag in soup.find_all(True, {"class": re.compile("price", re.I), "id": re.compile("price", re.I)}):
             match = price_regex.search(tag.get_text())
             if match:
-                price = float(match.group(1).replace(",", ""))
-                if 20 < price < 50000:
-                    return price
+                p = float(match.group(1).replace(",", ""))
+                has_vat = "vat" in tag.get_text().lower()
+                candidates.append((p, has_vat))
 
-        # Fallback: search the entire page text
-        text = soup.get_text()
-        for match in price_regex.finditer(text):
-            price = float(match.group(1).replace(",", ""))
-            if 20 < price < 50000:
-                return price
+        for m in price_regex.finditer(text):
+            p = float(m.group(1).replace(",", ""))
+            start = max(m.start() - 30, 0)
+            end = min(m.end() + 30, len(text))
+            snippet = text[start:end].lower()
+            has_vat = "vat" in snippet
+            candidates.append((p, has_vat))
 
-        return None
+        if not candidates:
+            return None, 1
+
+        if prefer_vat:
+            vat_prices = [p for p, vat in candidates if vat]
+            if vat_prices:
+                price = max(vat_prices)
+            else:
+                price = max(p for p, _ in candidates)
+        else:
+            price = min(p for p, _ in candidates)
+
+        quantity = extract_quantity(text)
+        return price, quantity
     except Exception:
+        return None, 1
+
+# --- Helper: Wrapper returning only price per coin ---
+def extract_price_from_url(url, prefer_vat=False):
+    price, qty = extract_price_info(url, prefer_vat=prefer_vat)
+    if price is None:
         return None
+    try:
+        return price / max(qty, 1)
+    except Exception:
+        return price
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="GoldCore Price Comparison", layout="wide")
 st.title("🟡 GoldCore vs Competitors – Live Price Comparison")
-st.markdown("""
+st.markdown(
+    """
 Upload a CSV or Excel file with product names as columns.
 Each column should contain:
 - Row 1: `GoldCore` (label)
 - Row 2: GoldCore URL
 - Row 3+: Competitor URLs
+
+Prices are reported **per coin**. Competitor prices for silver are scraped including VAT when available.
 All prices must be in GBP (£).
-""")
+"""
+)
 
 
 uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
@@ -76,8 +125,9 @@ if uploaded:
             st.warning(f"❌ Could not extract GoldCore price for {product}")
             continue
 
+        use_vat = "silver" in product.lower()
         for comp_url in competitor_urls:
-            comp_price = extract_price_from_url(comp_url)
+            comp_price = extract_price_from_url(comp_url, prefer_vat=use_vat)
             results.append({
                 "Product": product,
                 "GoldCore Price (£)": gc_price,
